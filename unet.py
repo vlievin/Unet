@@ -36,6 +36,18 @@ class inconv(nn.Module):
         x = self.conv(x)
         return x
     
+class outconv(nn.Module):
+    """
+    last convolution for the U-Net
+    """
+    def __init__(self, in_ch, out_ch):
+        super(outconv, self).__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, 1)
+
+    def forward(self, x):
+        x = self.conv(x)
+        return x
+    
 def conv3x3(in_channels, out_channels, stride=1):
     """
     3x3 convolution
