@@ -1,0 +1,5 @@
+python 3.6
+pytorch
+scipy
+gdal
+cv2
