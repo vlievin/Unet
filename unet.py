@@ -1,205 +1,240 @@
-"""
-U-net model from https://arxiv.org/abs/1505.04597 implemented with residual blocks, batch norm and dropout 
-"""
-
 import torch
-from torch import nn
-from torch.nn import functional as F
+import torch.nn as nn
 
-class double_conv(nn.Module):
+class gated_resnet(nn.Module):
     """
-    block composed of two successive convolutions each followed by batch normalization and ReLU activation function
+    Gated Residual Block
     """
-    def __init__(self, in_ch, out_ch):
-        super(double_conv, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
-    def forward(self, x):
-        x = self.conv(x)
-        return x
+    def __init__(self, num_filters, kernel_size, padding, nonlinearity=nn.ReLU, dropout=0.2, dilation=1,batchNormObject=nn.BatchNorm2d):
+        super(gated_resnet, self).__init__()
+        self.gated = True
+        num_hidden_filters =2 * num_filters if gated else num_filters
+        self.conv_input = nn.Conv2d(num_filters, num_hidden_filters, kernel_size=kernel_size,stride=1,padding=padding,dilation=dilation )
+        self.dropout = nn.Dropout2d(dropout)
+        self.nonlinearity = nonlinearity()
+        self.batch_norm1 = batchNormObject(num_hidden_filters)
+        self.conv_out = nn.Conv2d(num_hidden_filters, num_hidden_filters, kernel_size=kernel_size,stride=1,padding=padding,dilation=dilation )
+        self.batch_norm2 = batchNormObject(num_filters)
 
-class inconv(nn.Module):
-    """
-    initial convolution for the U-Net model
-    """
-    def __init__(self, in_ch, out_ch):
-        super(inconv, self).__init__()
-        self.conv = double_conv(in_ch, out_ch)
-
-    def forward(self, x):
-        x = self.conv(x)
-        return x
-    
-class outconv(nn.Module):
-    """
-    last convolution for the U-Net
-    """
-    def __init__(self, in_ch, out_ch):
-        super(outconv, self).__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, 1)
-
-    def forward(self, x):
-        x = self.conv(x)
-        return x
-    
-def conv3x3(in_channels, out_channels, stride=1):
-    """
-    3x3 convolution
-    """
-    return nn.Conv2d(in_channels, out_channels, kernel_size=3, 
-                     stride=stride, padding=1, bias=False)
-
-class ResidualBlock(nn.Module):
-    """
-    Residual Block with two convolution, dropout and batch normalization
-    dropout set according to https://arxiv.org/pdf/1605.07146.pdf
-    """
-    def __init__(self, in_channels, out_channels, stride=1, downsample=None, dropout=0,batch_norm=False):
-        super(ResidualBlock, self).__init__()
-        self.dropout = dropout
-        self.batch_norm = batch_norm
-        self.conv1 = conv3x3(in_channels, out_channels, stride)
-        if self.batch_norm:
-            self.bn1 = nn.BatchNorm2d(out_channels)
-        if self.dropout > 0:
-            self.drop = nn.Dropout2d()
-        self.conv2 = conv3x3(out_channels, out_channels)
-        if self.batch_norm:
-            self.bn2 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-        
-    def forward(self, x):
-        residual = x
-        out = self.conv1(x)
-        if self.batch_norm:
-            out = self.bn1(out)
-        if self.dropout > 0:
-            out = self.drop(out)
-        #out = self.relu(out)
-        out = self.conv2(out)
-        if self.batch_norm:
-            out = self.bn2(out)
-        if self.downsample:
-            residual = self.downsample(x)
-        out += residual
-        out = self.relu(out)
+    def forward(self, og_x):
+        x = self.conv_input(og_x)
+        x = self.batch_norm1(x)
+        x = self.nonlinearity(x)
+        x = self.dropout(x)
+        x = self.conv_out(x)
+        if self.gated:
+            a, b = torch.chunk(x, 2, dim=1)
+            c3 = a * F.sigmoid(b)
+        else:
+            c3 = x
+        out = og_x + c3
+        out = self.batch_norm2(out)
         return out
     
-def make_residual_layer(block,in_channels, out_channels, blocks, stride=1, dropout=0,batch_norm=False):
+class ResidualBlock(nn.Module):
     """
-    make a layer from intermediate blocks
+    Residual Block
     """
-    downsample = None
-    if (stride != 1) or (in_channels != out_channels):
-        downsample = nn.Sequential(
-            conv3x3(in_channels, out_channels, stride=stride),
-            nn.BatchNorm2d(out_channels))
-    layers = []
-    layers.append(block(in_channels, out_channels, stride, downsample, dropout=dropout, batch_norm=batch_norm))
-    in_channels = out_channels
-    for i in range(1, blocks):
-        layers.append(block(out_channels, out_channels, dropout=dropout, batch_norm=batch_norm))
-    return nn.Sequential(*layers)
+    def __init__(self, num_filters, kernel_size, padding, nonlinearity=nn.ReLU, dropout=0.2, dilation=1,batchNormObject=nn.BatchNorm2d):
+        super(ResidualBlock, self).__init__()
+        num_hidden_filters = num_filters
+        self.conv1 = nn.Conv2d(num_filters, num_hidden_filters, kernel_size=kernel_size,stride=1,padding=padding,dilation=dilation )
+        self.dropout = nn.Dropout2d(dropout)
+        self.nonlinearity = nonlinearity(inplace=False)
+        self.batch_norm1 = batchNormObject(num_hidden_filters)
+        self.conv2 = nn.Conv2d(num_hidden_filters, num_hidden_filters, kernel_size=kernel_size,stride=1,padding=padding,dilation=dilation )
+        self.batch_norm2 = batchNormObject(num_filters)
 
-
-class down_residual(nn.Module):
-    """
-    U-Net down block using on residual block
-    """
-    def __init__(self, in_ch, out_ch, dropout=0,batch_norm=False):
-        super(down_residual, self).__init__()
-        self.mpconv = nn.Sequential(
-            nn.MaxPool2d(2),
-            make_residual_layer(ResidualBlock, in_ch, out_ch, 1, dropout=dropout,batch_norm=batch_norm)
-        )
-
-    def forward(self, x):
-        x = self.mpconv(x)
-        return x
+    def forward(self, og_x):
+        x = og_x
+        x = self.dropout(x)
+        x = self.conv1(og_x)
+        #x = self.batch_norm1(x)
+        x = self.nonlinearity(x)
+        x = self.conv2(x)
+        out = og_x + x
+        #out = self.batch_norm2(out)
+        out = self.nonlinearity(out)
+        return out
     
-class up_residual(nn.Module):
+class ConvolutionalEncoder(nn.Module):
     """
-    U-Net up block using one residual block
+    Convolutional Encoder providing skip connections
     """
-    def __init__(self, in_ch, out_ch, dropout=0,batch_norm=False):
-        super(up_residual, self).__init__()
-        self.up = nn.UpsamplingBilinear2d(scale_factor=2)
-        #self.up = nn.ConvTranspose2d(in_ch, out_ch, 2, stride=2)
-        self.conv = make_residual_layer(ResidualBlock, in_ch, out_ch, 1, dropout=dropout,batch_norm=batch_norm)
+    def __init__(self,n_features_input,num_hidden_features,kernel_size,padding,n_resblocks,dropout=0.2, blockObject=ResidualBlock,batchNormObject=nn.BatchNorm2d):
+        """
+        n_features_input (int): number of intput features
+        num_hidden_features (list(int)): number of features for each stage
+        kernel_size (int): convolution kernel size
+        padding (int): convolution padding
+        n_resblocks (int): number of residual blocks at each stage
+        dropout (float): dropout probability
+        blockObject (nn.Module): Residual block to use. Default is ResidualBlock
+        batchNormObject (nn.Module): normalization layer. Default is nn.BatchNorm2d
+        """
+        super(ConvolutionalEncoder,self).__init__()
+        self.n_features_input = n_features_input
+        self.num_hidden_features = num_hidden_features
+        self.stages = nn.ModuleList()
+        # input convolution block
+        block = [nn.Conv2d(n_features_input, num_hidden_features[0], kernel_size=kernel_size,stride=1, padding=padding)]
+        for _ in range(n_resblocks):
+            block += [blockObject(num_hidden_features[0], kernel_size, padding, dropout=dropout,batchNormObject=batchNormObject)]
+        self.stages.append(nn.Sequential(*block))
+        # layers
+        for features_in,features_out in [num_hidden_features[i:i+2] for i in range(0,len(num_hidden_features), 1)][:-1]:
+            # downsampling
+            block = [nn.MaxPool2d(2),nn.Conv2d(features_in, features_out, kernel_size=1,padding=0 ),batchNormObject(features_out),nn.ReLU()]
+            #block = [nn.Conv2d(features_in, features_out, kernel_size=kernel_size,stride=2,padding=padding ),nn.BatchNorm2d(features_out),nn.ReLU()]
+            # residual blocks
+            for _ in range(n_resblocks):
+                block += [blockObject(features_out, kernel_size, padding, dropout=dropout,batchNormObject=batchNormObject)]
+            self.stages.append(nn.Sequential(*block)) 
+            
+    def forward(self,x):
+        skips = []
+        for stage in self.stages:
+            x = stage(x)
+            skips.append(x)
+        return x,skips
+    def getInputShape(self):
+        return (-1,self.n_features_input,-1,-1)
+    def getOutputShape(self):
+        return (-1,self.num_hidden_features[-1], -1,-1)
+    
+            
+class ConvolutionalDecoder(nn.Module):
+    """
+    Convolutional Decoder taking skip connections
+    """
+    def __init__(self,n_features_output,num_hidden_features,kernel_size,padding,n_resblocks,dropout,blockObject=ResidualBlock,batchNormObject=nn.BatchNorm2d):
+        """
+        n_features_output (int): number of output features
+        num_hidden_features (list(int)): number of features for each stage
+        kernel_size (int): convolution kernel size
+        padding (int): convolution padding
+        n_resblocks (int): number of residual blocks at each stage
+        dropout (float): dropout probability
+        blockObject (nn.Module): Residual block to use. Default is ResidualBlock
+        batchNormObject (nn.Module): normalization layer. Default is nn.BatchNorm2d
+        """
+        super(ConvolutionalDecoder,self).__init__()
+        self.n_features_output = n_features_output
+        self.num_hidden_features = num_hidden_features
+        self.upConvolutions = nn.ModuleList()
+        self.skipMergers = nn.ModuleList()
+        self.residualBlocks = nn.ModuleList()
+        # input convolution block
+        # layers
+        for features_in,features_out in [num_hidden_features[i:i+2] for i in range(0,len(num_hidden_features), 1)][:-1]:
+            # downsampling
+            self.upConvolutions.append(nn.Sequential(nn.ConvTranspose2d(features_in, features_out, kernel_size=2, stride=2,padding=0 ),batchNormObject(features_out),nn.ReLU()))
+            self.skipMergers.append(nn.Conv2d(2*features_out, features_out, kernel_size=kernel_size,stride=1, padding=padding))
+            # residual blocks
+            block = []
+            for _ in range(n_resblocks):
+                block += [blockObject(features_out, kernel_size, padding, dropout=dropout,batchNormObject=batchNormObject)]
+            self.residualBlocks.append(nn.Sequential(*block))   
+        # output convolution block
+        block = [nn.Conv2d(num_hidden_features[-1],n_features_output, kernel_size=kernel_size,stride=1, padding=padding)]
+        self.output_convolution = nn.Sequential(*block)
 
-    def forward(self, x1, x2):
-        x1 = self.up(x1)
-        diffX = x1.size()[2] - x2.size()[2]
-        diffY = x1.size()[3] - x2.size()[3]
-        x2 = F.pad(x2, (diffX // 2, diffX // 2,
-                        diffY // 2, diffY // 2))
-        
-        x = torch.cat([x2, x1], dim=1)
-        x = self.conv(x)
-        return x
+    def forward(self,x, skips):
+        for up,merge,conv,skip in zip(self.upConvolutions,self.skipMergers, self.residualBlocks,skips):
+            x = up(x)
+            cat = torch.cat([x,skip],1)
+            x = merge(cat)
+            x = conv(x)
+        return self.output_convolution(x)
+    def getInputShape(self):
+        return (-1,self.num_hidden_features[0],-1,-1)
+    def getOutputShape(self):
+        return (-1,self.n_features_output, -1,-1)
+    
+    
+class DilatedConvolutions(nn.Module):
+    """
+    Sequential Dialted convolutions
+    """
+    def __init__(self, n_channels, n_convolutions, dropout):
+        super(DilatedConvolutions, self).__init__()
+        kernel_size = 3
+        padding = 1
+        self.dropout = nn.Dropout2d(dropout)
+        self.non_linearity = nn.ReLU(inplace=True)
+        self.strides = [2**(k+1) for k in range(n_convolutions)]
+        convs = [nn.Conv2d(n_channels, n_channels, kernel_size=kernel_size,dilation=s, padding=s) for s in self.strides ]
+        self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        for c in convs:
+            self.convs.append(c)
+            self.bns.append(nn.BatchNorm2d(n_channels))
+    def forward(self,x):
+        skips = []
+        for (c,bn,s) in zip(self.convs,self.bns,self.strides):
+            x_in = x
+            x = c(x)
+            x = bn(x)
+            x = self.non_linearity(x)
+            x = self.dropout(x)
+            x = x_in + x
+            skips.append(x)
+        return x,skips
+    
+class DilatedConvolutions2(nn.Module):
+    """
+    Sequential Dialted convolutions
+    """
+    def __init__(self, n_channels, n_convolutions,dropout,kernel_size,blockObject=ResidualBlock,batchNormObject=nn.BatchNorm2d):
+        super(DilatedConvolutions2, self).__init__()
+        self.dilatations = [2**(k+1) for k in range(n_convolutions)]
+        self.blocks = nn.ModuleList([blockObject(n_channels, kernel_size, d, dropout=dropout, dilation=d,batchNormObject=batchNormObject) for d in self.dilatations ])
+    def forward(self,x):
+        skips = []
+        for b in self.blocks:
+            x = b(x)
+            skips.append(x)
+        return x, skips
     
 class UNet(nn.Module):
     """
-    U-Net model with custom number of layers, dropout and batch normalization
+    U-Net model with dynamic number of layers, Residual Blocks, Dilated Convolutions, Dropout and Group Normalization
     """
-    def __init__(self, in_channels, out_channels, depth = 5, n_features_zero = 64, dropout=0, batch_norm=True):
+    def __init__(self, in_channels, out_channels, num_hidden_features,n_resblocks,num_dilated_convs, dropout=0, gated=False, padding=1, kernel_size=3,group_norm=32):
         """
         initialize the model
         Args:
             in_channels (int): number of input channels (image=3)
             out_channels (int): number of output channels (n_classes)
-            depth (int): number of down/up layers
-            n_features (int): number of initial features
+            num_hidden_features (list(int)): number of hidden features for each layer (the number of layer is the lenght of this list)
+            n_resblocks (int): number of residual blocks at each layer 
+            num_dilated_convs (int): number of dilated convolutions at the last layer
             dropout (float): float in [0,1]: dropout probability
-            batch_norm (bool): use batch normalization or not
+            gated (bool): use gated Convolutions, default is False
+            padding (int): padding for the convolutions
+            kernel_size (int): kernel size for the convolutions
+            group_norm (bool): number of groups to use for Group Normalization, default is 32, if zero: use nn.BatchNorm2d
         """
         super(UNet, self).__init__()
-        n_features = n_features_zero
-        self.inc = inconv(in_channels,n_features)
-        # DOWN
-        self.downs = torch.nn.ModuleList()
-        for k in range(depth-1):
-            d = down_residual(n_features, 2*n_features, dropout=dropout,batch_norm=batch_norm)
-            n_features = 2 * n_features
-            self.downs += [d]
-        self.downs += [down_residual(n_features, n_features, dropout=dropout,batch_norm=batch_norm)]
-        # UP
-        self.ups = torch.nn.ModuleList()
-        for k in range(depth):
-            u = up_residual(2*n_features, n_features//2, dropout=dropout,batch_norm=batch_norm)
-            n_features = n_features // 2
-            self.ups += [u]
-        self.outc = outconv(n_features, out_channels)
+        if group_norm > 0:
+            for h in num_hidden_features:
+                assert h%group_norm==0, "Number of features at each layer must be divisible by 'group_norm'"
+        blockObject = gated_resnet if gated else ResidualBlock
+        batchNormObject = lambda n_features : nn.GroupNorm(group_norm,n_features) if group_norm > 0 else nn.BatchNorm2d
+        self.encoder = ConvolutionalEncoder(in_channels,num_hidden_features,kernel_size,padding,n_resblocks,dropout=dropout,blockObject=blockObject,batchNormObject=batchNormObject)
+        if num_dilated_convs > 0:
+            self.dilatedConvs = DilatedConvolutions2(num_hidden_features[-1], num_dilated_convs,dropout,kernel_size,blockObject=blockObject,batchNormObject=batchNormObject)
+            #self.dilatedConvs = DilatedConvolutions(num_hidden_features[-1],num_dilated_convs,dropout)
+        else:
+            self.dilatedConvs = None
+        self.decoder = ConvolutionalDecoder(out_channels,num_hidden_features[::-1],kernel_size,padding,n_resblocks,dropout=dropout,blockObject=blockObject,batchNormObject=batchNormObject)
         
     def forward(self, x):
-        x = self.inc(x)
-        bridges = []
-        for d in self.downs:
-            bridges += [x]
-            x = d(x)
-        for k,u in enumerate(self.ups):
-            x = u(x,bridges[len(bridges)-1-k])
-        x = self.outc(x)
+        x,skips = self.encoder(x)
+        if self.dilatedConvs is not None:
+            x,dilated_skips = self.dilatedConvs(x)
+            for d in dilated_skips:
+                x += d
+            x += skips[-1]
+        x = self.decoder(x,skips[:-1][::-1])
         return x
-    
-    def debug(self, x):
-        x = self.inc(x)
-        bridges = []
-        downs = []
-        ups = []
-        for d in self.downs:
-            bridges += [x]
-            x = d(x)
-            downs.append(x)
-        for k,u in enumerate(self.ups):
-            x = u(x,bridges[len(bridges)-1-k])
-            ups.append(x)
-        x = self.outc(x)
-        return x, downs, ups
