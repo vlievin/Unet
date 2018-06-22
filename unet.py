@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -49,11 +50,11 @@ class ResidualBlock(nn.Module):
         x = og_x
         x = self.dropout(x)
         x = self.conv1(og_x)
-        #x = self.batch_norm1(x)
+        x = self.batch_norm1(x)
         x = self.nonlinearity(x)
         x = self.conv2(x)
         out = og_x + x
-        #out = self.batch_norm2(out)
+        out = self.batch_norm2(out)
         out = self.nonlinearity(out)
         return out
     
@@ -61,7 +62,7 @@ class ConvolutionalEncoder(nn.Module):
     """
     Convolutional Encoder providing skip connections
     """
-    def __init__(self,n_features_input,num_hidden_features,kernel_size,padding,n_resblocks,dropout=0.2, blockObject=ResidualBlock,batchNormObject=nn.BatchNorm2d):
+    def __init__(self,n_features_input,num_hidden_features,kernel_size,padding,n_resblocks,dropout_min=0,dropout_max=0.2, blockObject=ResidualBlock,batchNormObject=nn.BatchNorm2d):
         """
         n_features_input (int): number of intput features
         num_hidden_features (list(int)): number of features for each stage
@@ -76,10 +77,13 @@ class ConvolutionalEncoder(nn.Module):
         self.n_features_input = n_features_input
         self.num_hidden_features = num_hidden_features
         self.stages = nn.ModuleList()
+        dropout = iter([(1-t)*dropout_min + t*dropout_max   for t in np.linspace(0,1,(len(num_hidden_features)))])
+        dropout = iter(dropout)
         # input convolution block
         block = [nn.Conv2d(n_features_input, num_hidden_features[0], kernel_size=kernel_size,stride=1, padding=padding)]
         for _ in range(n_resblocks):
-            block += [blockObject(num_hidden_features[0], kernel_size, padding, dropout=dropout,batchNormObject=batchNormObject)]
+            p = next(iter(dropout))
+            block += [blockObject(num_hidden_features[0], kernel_size, padding, dropout=p,batchNormObject=batchNormObject)]
         self.stages.append(nn.Sequential(*block))
         # layers
         for features_in,features_out in [num_hidden_features[i:i+2] for i in range(0,len(num_hidden_features), 1)][:-1]:
@@ -87,8 +91,9 @@ class ConvolutionalEncoder(nn.Module):
             block = [nn.MaxPool2d(2),nn.Conv2d(features_in, features_out, kernel_size=1,padding=0 ),batchNormObject(features_out),nn.ReLU()]
             #block = [nn.Conv2d(features_in, features_out, kernel_size=kernel_size,stride=2,padding=padding ),nn.BatchNorm2d(features_out),nn.ReLU()]
             # residual blocks
+            p = next(iter(dropout))
             for _ in range(n_resblocks):
-                block += [blockObject(features_out, kernel_size, padding, dropout=dropout,batchNormObject=batchNormObject)]
+                block += [blockObject(features_out, kernel_size, padding, dropout=p,batchNormObject=batchNormObject)]
             self.stages.append(nn.Sequential(*block)) 
             
     def forward(self,x):
@@ -107,7 +112,7 @@ class ConvolutionalDecoder(nn.Module):
     """
     Convolutional Decoder taking skip connections
     """
-    def __init__(self,n_features_output,num_hidden_features,kernel_size,padding,n_resblocks,dropout,blockObject=ResidualBlock,batchNormObject=nn.BatchNorm2d):
+    def __init__(self,n_features_output,num_hidden_features,kernel_size,padding,n_resblocks,dropout_min=0,dropout_max=0.2,blockObject=ResidualBlock,batchNormObject=nn.BatchNorm2d):
         """
         n_features_output (int): number of output features
         num_hidden_features (list(int)): number of features for each stage
@@ -124,16 +129,18 @@ class ConvolutionalDecoder(nn.Module):
         self.upConvolutions = nn.ModuleList()
         self.skipMergers = nn.ModuleList()
         self.residualBlocks = nn.ModuleList()
+        dropout = iter([(1-t)*dropout_min + t*dropout_max   for t in np.linspace(0,1,(len(num_hidden_features)))][::-1])
         # input convolution block
         # layers
         for features_in,features_out in [num_hidden_features[i:i+2] for i in range(0,len(num_hidden_features), 1)][:-1]:
             # downsampling
-            self.upConvolutions.append(nn.Sequential(nn.ConvTranspose2d(features_in, features_out, kernel_size=2, stride=2,padding=0 ),batchNormObject(features_out),nn.ReLU()))
+            self.upConvolutions.append(nn.Sequential(nn.ConvTranspose2d(features_in, features_out, kernel_size=3, stride=2,padding=1,output_padding=1),batchNormObject(features_out),nn.ReLU()))
             self.skipMergers.append(nn.Conv2d(2*features_out, features_out, kernel_size=kernel_size,stride=1, padding=padding))
             # residual blocks
             block = []
+            p = next(iter(dropout))
             for _ in range(n_resblocks):
-                block += [blockObject(features_out, kernel_size, padding, dropout=dropout,batchNormObject=batchNormObject)]
+                block += [blockObject(features_out, kernel_size, padding, dropout=p,batchNormObject=batchNormObject)]
             self.residualBlocks.append(nn.Sequential(*block))   
         # output convolution block
         block = [nn.Conv2d(num_hidden_features[-1],n_features_output, kernel_size=kernel_size,stride=1, padding=padding)]
@@ -200,7 +207,7 @@ class UNet(nn.Module):
     """
     U-Net model with dynamic number of layers, Residual Blocks, Dilated Convolutions, Dropout and Group Normalization
     """
-    def __init__(self, in_channels, out_channels, num_hidden_features,n_resblocks,num_dilated_convs, dropout=0, gated=False, padding=1, kernel_size=3,group_norm=32):
+    def __init__(self, in_channels, out_channels, num_hidden_features,n_resblocks,num_dilated_convs, dropout_min=0, dropout_max=0, gated=False, padding=1, kernel_size=3,group_norm=32):
         """
         initialize the model
         Args:
@@ -221,13 +228,13 @@ class UNet(nn.Module):
                 assert h%group_norm==0, "Number of features at each layer must be divisible by 'group_norm'"
         blockObject = gated_resnet if gated else ResidualBlock
         batchNormObject = lambda n_features : nn.GroupNorm(group_norm,n_features) if group_norm > 0 else nn.BatchNorm2d
-        self.encoder = ConvolutionalEncoder(in_channels,num_hidden_features,kernel_size,padding,n_resblocks,dropout=dropout,blockObject=blockObject,batchNormObject=batchNormObject)
+        self.encoder = ConvolutionalEncoder(in_channels,num_hidden_features,kernel_size,padding,n_resblocks,dropout_min=dropout_min,dropout_max=dropout_max,blockObject=blockObject,batchNormObject=batchNormObject)
         if num_dilated_convs > 0:
-            self.dilatedConvs = DilatedConvolutions2(num_hidden_features[-1], num_dilated_convs,dropout,kernel_size,blockObject=blockObject,batchNormObject=batchNormObject)
-            #self.dilatedConvs = DilatedConvolutions(num_hidden_features[-1],num_dilated_convs,dropout)
+            #self.dilatedConvs = DilatedConvolutions2(num_hidden_features[-1], num_dilated_convs,dropout_max,kernel_size,blockObject=blockObject,batchNormObject=batchNormObject)
+            self.dilatedConvs = DilatedConvolutions(num_hidden_features[-1],num_dilated_convs,dropout_max) # <v11 uses dilatedConvs2
         else:
             self.dilatedConvs = None
-        self.decoder = ConvolutionalDecoder(out_channels,num_hidden_features[::-1],kernel_size,padding,n_resblocks,dropout=dropout,blockObject=blockObject,batchNormObject=batchNormObject)
+        self.decoder = ConvolutionalDecoder(out_channels,num_hidden_features[::-1],kernel_size,padding,n_resblocks,dropout_min=dropout_min,dropout_max=dropout_max,blockObject=blockObject,batchNormObject=batchNormObject)
         
     def forward(self, x):
         x,skips = self.encoder(x)
